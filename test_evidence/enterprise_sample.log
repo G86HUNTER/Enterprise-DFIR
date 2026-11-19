@@ -1,0 +1,5 @@
+2026-11-18 09:15:10 - User login failed - Host: WORKSTATION-01 - Source: 192.168.1.50
+2026-11-18 09:16:22 - User login failed - Host: WORKSTATION-01 - Source: 192.168.1.50
+2026-11-18 09:18:05 - User login successful - Host: WORKSTATION-01 - Source: 192.168.1.50
+2026-11-18 09:20:40 - Suspicious PowerShell process started - Host: WORKSTATION-01
+2026-11-18 09:25:12 - Outbound network connection detected - Host: WORKSTATION-01 - Destination: 203.0.113.25

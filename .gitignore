@@ -1,0 +1,38 @@
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python artefacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+
+# Databases and uploaded evidence
+*.db
+*.sqlite
+/data/
+/uploads/
+
+# Local recovery backup
+src/app_damaged_backup.py
+
+# Secrets and configuration
+config.yml
+*.env
+.env
+.secret
+
+# Logs and temporary files
+logs/
+tmp/
+temp/
+
+# IDE files
+.vscode/
+.idea/
