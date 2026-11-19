@@ -1,9 +1,11 @@
-
 from src.database import get_connection
 from src.analysis.mitre_mapping import map_mitre_technique
 
 
-def store_timeline_events(events, source_file):
+def store_timeline_events(user_id, events, source_file):
+    if not user_id:
+        raise ValueError("A valid user_id is required.")
+
     conn = get_connection()
     cur = conn.cursor()
 
@@ -26,25 +28,27 @@ def store_timeline_events(events, source_file):
                   AND description = ?
                   AND source = ?
                   AND evidence_id IS NULL
+                  AND user_id = ?
                 """,
                 (
                     original_ts,
                     event["host"],
                     event["category"],
                     event["description"],
-                    source_file
+                    source_file,
+                    user_id
                 )
             ).fetchone()
 
             if existing:
-                # Update MITRE mapping for previously imported events.
                 cur.execute(
                     """
                     UPDATE events
                     SET mitre = ?
                     WHERE id = ?
+                      AND user_id = ?
                     """,
-                    (mitre, existing["id"])
+                    (mitre, existing["id"], user_id)
                 )
                 continue
 
@@ -59,9 +63,10 @@ def store_timeline_events(events, source_file):
                     severity,
                     description,
                     mitre,
-                    evidence_id
+                    evidence_id,
+                    user_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     None,
@@ -72,7 +77,8 @@ def store_timeline_events(events, source_file):
                     event["severity"],
                     event["description"],
                     mitre,
-                    None
+                    None,
+                    user_id
                 )
             )
 

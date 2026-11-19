@@ -36,3 +36,16 @@ temp/
 # IDE files
 .vscode/
 .idea/
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets and local data
+.env
+*.db
+instance/
+uploads/
+
+# Temporary backup files
+*.bak

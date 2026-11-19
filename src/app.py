@@ -12,10 +12,12 @@ from flask import (
     redirect,
     url_for,
     render_template_string,
-    flash
+    flash,
+    session
 )
 
 from werkzeug.utils import secure_filename
+from src.auth import auth, login_required, create_csrf_token, valid_csrf
 
 from src.database import init_db, get_connection
 from src.timeline.parser import parse_log_file
@@ -39,10 +41,39 @@ from src.investigation import (
 
 app = Flask(__name__)
 
-app.secret_key = "replace-with-strong-secret"
+secret_key = os.environ.get("SECRET_KEY")
+
+if not secret_key:
+    if os.environ.get("APP_ENV") == "production":
+        raise RuntimeError("SECRET_KEY must be configured in production.")
+    secret_key = "dev-only-change-this-secret-before-deployment"
+
+app.config["SECRET_KEY"] = secret_key
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = (
+    os.environ.get("APP_ENV") == "production"
+)
+
+app.register_blueprint(auth)
+
+
+@app.context_processor
+def inject_csrf_token():
+    return {"csrf_token": create_csrf_token}
+
+
+@app.before_request
+def protect_all_post_requests():
+    if request.method == "POST" and not valid_csrf():
+        return "Invalid or missing security token.", 400
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-UPLOAD_FOLDER = BASE_DIR / "uploads"
+
+UPLOAD_FOLDER = Path(
+    os.environ.get("UPLOAD_FOLDER", BASE_DIR / "uploads")
+)
 
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
 
@@ -89,6 +120,7 @@ def current_timestamp():
 # --------------------------------------------------
 
 @app.route("/")
+@login_required
 def home():
     return redirect(url_for("evidence"))
 
@@ -106,6 +138,7 @@ def health():
 # --------------------------------------------------
 
 @app.route("/evidence", methods=["GET", "POST"])
+@login_required
 def evidence():
 
     if request.method == "POST":
@@ -130,7 +163,9 @@ def evidence():
 
         stored_filename = f"{evidence_id}.{extension}"
 
-        file_path = UPLOAD_FOLDER / stored_filename
+        user_upload_folder = UPLOAD_FOLDER / str(session["user_id"])
+        user_upload_folder.mkdir(parents=True, exist_ok=True)
+        file_path = user_upload_folder / stored_filename
 
         try:
             uploaded_file.save(file_path)
@@ -152,6 +187,7 @@ def evidence():
                     """
                     INSERT INTO evidence (
                         evidence_id,
+                        user_id,
                         original_filename,
                         file_type,
                         file_path,
@@ -161,10 +197,11 @@ def evidence():
                         collected_at,
                         investigator_notes
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         evidence_id,
+                        session["user_id"],
                         original_filename,
                         extension.upper(),
                         str(file_path),
@@ -224,8 +261,10 @@ def evidence():
             """
             SELECT *
             FROM evidence
+            WHERE user_id = ?
             ORDER BY collected_at DESC
-            """
+            """,
+            (session["user_id"],)
         ).fetchall()
 
         evidence_records = []
@@ -266,7 +305,50 @@ def evidence():
               rel="stylesheet">
     </head>
 
+    
     <body class="bg-light">
+
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark shadow-sm">
+        <div class="container-fluid px-4">
+            <a class="navbar-brand fw-bold" href="{{ url_for('home') }}">
+                Enterprise DFIR
+            </a>
+
+            <div class="d-flex align-items-center gap-3 flex-wrap">
+                <a class="nav-link text-white"
+                   href="{{ url_for('home') }}">Evidence</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('timeline') }}">Timeline</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('alerts') }}">Alerts</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('incidents') }}">Incidents</a>
+
+                <span class="text-white-50">
+                    Logged in as:
+                    <strong class="text-white">
+                        {{ session.get('username', 'User') }}
+                    </strong>
+                </span>
+
+                <form method="POST"
+                      action="{{ url_for('auth.logout') }}"
+                      class="m-0">
+                    <input type="hidden"
+                           name="csrf_token"
+                           value="{{ csrf_token() }}">
+                    <button type="submit"
+                            class="btn btn-outline-light btn-sm">
+                        Logout
+                    </button>
+                </form>
+            </div>
+        </div>
+    </nav>
+
 
     <div class="container py-5">
 
@@ -279,16 +361,6 @@ def evidence():
                 </p>
             </div>
 
-            <div>
-                <a href="{{ url_for('timeline') }}"
-                   class="btn btn-outline-primary">Timeline</a>
-
-                <a href="{{ url_for('alerts') }}"
-                   class="btn btn-outline-danger">Alerts</a>
-
-                <a href="{{ url_for('incidents') }}"
-                   class="btn btn-outline-dark">Incidents</a>
-            </div>
         </div>
 
         {% with messages = get_flashed_messages() %}
@@ -304,6 +376,7 @@ def evidence():
 
                 <form method="POST"
                       enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                     <div class="mb-3">
                         <label class="form-label">Select Evidence File</label>
@@ -384,6 +457,7 @@ def evidence():
                                             'verify_evidence',
                                             evidence_id=item.evidence_id
                                           ) }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                         <button class="btn btn-sm btn-outline-primary">
                                             Verify
                                         </button>
@@ -415,6 +489,7 @@ def evidence():
     "/evidence/<evidence_id>/verify",
     methods=["POST"]
 )
+@login_required
 def verify_evidence(evidence_id):
 
     conn = get_connection()
@@ -425,17 +500,23 @@ def verify_evidence(evidence_id):
             SELECT *
             FROM evidence
             WHERE evidence_id = ?
+              AND user_id = ?
             """,
-            (evidence_id,)
+            (evidence_id, session["user_id"])
         ).fetchone()
 
         if not record:
             flash("Evidence record not found.")
             return redirect(url_for("evidence"))
 
-        file_path = Path(record["file_path"])
+        user_upload_folder = (
+            UPLOAD_FOLDER / str(session["user_id"])
+        ).resolve()
+        file_path = Path(record["file_path"]).resolve()
 
-        if not file_path.exists():
+        if user_upload_folder not in file_path.parents:
+            result = "FAILED - Invalid evidence storage path"
+        elif not file_path.is_file():
             result = "FAILED - Evidence file missing"
         else:
             actual_hash = calculate_sha256(file_path)
@@ -478,6 +559,7 @@ def verify_evidence(evidence_id):
 # --------------------------------------------------
 
 @app.route("/timeline", methods=["GET", "POST"])
+@login_required
 def timeline():
 
     if request.method == "POST":
@@ -505,7 +587,9 @@ def timeline():
             f"timeline_{uuid.uuid4().hex}_{original_filename}"
         )
 
-        file_path = UPLOAD_FOLDER / stored_filename
+        user_upload_folder = UPLOAD_FOLDER / str(session["user_id"])
+        user_upload_folder.mkdir(parents=True, exist_ok=True)
+        file_path = user_upload_folder / stored_filename
 
         try:
             uploaded_file.save(file_path)
@@ -516,6 +600,7 @@ def timeline():
                 flash("No valid timestamped events were found in the log.")
             else:
                 inserted = store_timeline_events(
+                    session["user_id"],
                     parsed_events,
                     str(file_path)
                 )
@@ -537,8 +622,10 @@ def timeline():
             """
             SELECT *
             FROM events
+            WHERE user_id = ?
             ORDER BY original_ts DESC
-            """
+            """,
+            (session["user_id"],)
         ).fetchall()
 
     finally:
@@ -572,7 +659,50 @@ def timeline():
               rel="stylesheet">
     </head>
 
+    
     <body class="bg-light">
+
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark shadow-sm">
+        <div class="container-fluid px-4">
+            <a class="navbar-brand fw-bold" href="{{ url_for('home') }}">
+                Enterprise DFIR
+            </a>
+
+            <div class="d-flex align-items-center gap-3 flex-wrap">
+                <a class="nav-link text-white"
+                   href="{{ url_for('home') }}">Evidence</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('timeline') }}">Timeline</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('alerts') }}">Alerts</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('incidents') }}">Incidents</a>
+
+                <span class="text-white-50">
+                    Logged in as:
+                    <strong class="text-white">
+                        {{ session.get('username', 'User') }}
+                    </strong>
+                </span>
+
+                <form method="POST"
+                      action="{{ url_for('auth.logout') }}"
+                      class="m-0">
+                    <input type="hidden"
+                           name="csrf_token"
+                           value="{{ csrf_token() }}">
+                    <button type="submit"
+                            class="btn btn-outline-light btn-sm">
+                        Logout
+                    </button>
+                </form>
+            </div>
+        </div>
+    </nav>
+
 
     <div class="container py-5">
 
@@ -584,16 +714,6 @@ def timeline():
                 </p>
             </div>
 
-            <div>
-                <a href="{{ url_for('evidence') }}"
-                   class="btn btn-outline-secondary">Evidence</a>
-
-                <a href="{{ url_for('alerts') }}"
-                   class="btn btn-outline-danger">Alerts</a>
-
-                <a href="{{ url_for('incidents') }}"
-                   class="btn btn-outline-dark">Incidents</a>
-            </div>
         </div>
 
         {% with messages = get_flashed_messages() %}
@@ -609,6 +729,7 @@ def timeline():
 
                 <form method="POST"
                       enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                     <input type="file"
                            name="file"
@@ -706,6 +827,7 @@ def timeline():
 # --------------------------------------------------
 
 @app.route("/alerts", methods=["GET", "POST"])
+@login_required
 def alerts():
 
     if request.method == "POST":
@@ -730,6 +852,7 @@ def alerts():
             )
 
             incident_ref = create_incident(
+                user_id=session["user_id"],
                 title=title,
                 description=(
                     "Automatically converted from a detected security alert.\n"
@@ -741,6 +864,7 @@ def alerts():
             )
 
             add_investigation_update(
+                user_id=session["user_id"],
                 incident_ref=incident_ref,
                 notes=(
                     "Incident created from Security Alerts.\n"
@@ -768,8 +892,10 @@ def alerts():
             """
             SELECT original_ts, host, severity, description
             FROM events
+            WHERE user_id = ?
             ORDER BY original_ts ASC
-            """
+            """,
+            (session["user_id"],)
         ).fetchall()
 
     finally:
@@ -820,7 +946,50 @@ def alerts():
               rel="stylesheet">
     </head>
 
+    
     <body class="bg-light">
+
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark shadow-sm">
+        <div class="container-fluid px-4">
+            <a class="navbar-brand fw-bold" href="{{ url_for('home') }}">
+                Enterprise DFIR
+            </a>
+
+            <div class="d-flex align-items-center gap-3 flex-wrap">
+                <a class="nav-link text-white"
+                   href="{{ url_for('home') }}">Evidence</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('timeline') }}">Timeline</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('alerts') }}">Alerts</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('incidents') }}">Incidents</a>
+
+                <span class="text-white-50">
+                    Logged in as:
+                    <strong class="text-white">
+                        {{ session.get('username', 'User') }}
+                    </strong>
+                </span>
+
+                <form method="POST"
+                      action="{{ url_for('auth.logout') }}"
+                      class="m-0">
+                    <input type="hidden"
+                           name="csrf_token"
+                           value="{{ csrf_token() }}">
+                    <button type="submit"
+                            class="btn btn-outline-light btn-sm">
+                        Logout
+                    </button>
+                </form>
+            </div>
+        </div>
+    </nav>
+
 
     <div class="container py-5">
 
@@ -833,16 +1002,6 @@ def alerts():
                 </p>
             </div>
 
-            <div>
-                <a href="{{ url_for('timeline') }}"
-                   class="btn btn-outline-primary">Incident Timeline</a>
-
-                <a href="{{ url_for('incidents') }}"
-                   class="btn btn-outline-danger">Investigation Cases</a>
-
-                <a href="{{ url_for('evidence') }}"
-                   class="btn btn-outline-secondary">Evidence</a>
-            </div>
 
         </div>
 
@@ -911,6 +1070,7 @@ def alerts():
                         </p>
 
                         <form method="POST">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                             <input type="hidden"
                                    name="title"
@@ -959,6 +1119,7 @@ def alerts():
 # --------------------------------------------------
 
 @app.route("/incidents", methods=["GET", "POST"])
+@login_required
 def incidents():
 
     if request.method == "POST":
@@ -970,6 +1131,7 @@ def incidents():
             if action == "create":
 
                 incident_ref = create_incident(
+                    user_id=session["user_id"],
                     title=request.form.get("title", ""),
                     description=request.form.get("description", ""),
                     severity=request.form.get("severity", "Medium"),
@@ -986,7 +1148,9 @@ def incidents():
                 incident_ref = request.form.get("incident_ref")
                 status = request.form.get("status")
 
-                if update_incident_status(incident_ref, status):
+                if update_incident_status(
+                    session["user_id"], incident_ref, status
+                ):
                     flash("Incident status updated successfully.")
                 else:
                     flash("Incident not found.")
@@ -994,6 +1158,7 @@ def incidents():
             elif action == "finding":
 
                 add_investigation_update(
+                    user_id=session["user_id"],
                     incident_ref=request.form.get("incident_ref"),
                     notes=request.form.get("notes", ""),
                     investigator=request.form.get("investigator") or None,
@@ -1005,6 +1170,7 @@ def incidents():
             elif action == "link_evidence":
 
                 link_evidence(
+                    session["user_id"],
                     request.form.get("incident_ref"),
                     request.form.get("evidence_id")
                 )
@@ -1016,7 +1182,7 @@ def incidents():
 
         return redirect(url_for("incidents"))
 
-    all_incidents = get_incidents()
+    all_incidents = get_incidents(session["user_id"])
 
     conn = get_connection()
 
@@ -1025,8 +1191,10 @@ def incidents():
             """
             SELECT evidence_id, original_filename, host
             FROM evidence
+            WHERE user_id = ?
             ORDER BY collected_at DESC
-            """
+            """,
+            (session["user_id"],)
         ).fetchall()
 
     finally:
@@ -1039,10 +1207,10 @@ def incidents():
         incident_details.append({
             "incident": incident,
             "updates": get_incident_updates(
-                incident["incident_ref"]
+                session["user_id"], incident["incident_ref"]
             ),
             "evidence": get_incident_evidence(
-                incident["incident_ref"]
+                session["user_id"], incident["incident_ref"]
             )
         })
 
@@ -1060,7 +1228,50 @@ def incidents():
               rel="stylesheet">
     </head>
 
+    
     <body class="bg-light">
+
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark shadow-sm">
+        <div class="container-fluid px-4">
+            <a class="navbar-brand fw-bold" href="{{ url_for('home') }}">
+                Enterprise DFIR
+            </a>
+
+            <div class="d-flex align-items-center gap-3 flex-wrap">
+                <a class="nav-link text-white"
+                   href="{{ url_for('home') }}">Evidence</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('timeline') }}">Timeline</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('alerts') }}">Alerts</a>
+
+                <a class="nav-link text-white"
+                   href="{{ url_for('incidents') }}">Incidents</a>
+
+                <span class="text-white-50">
+                    Logged in as:
+                    <strong class="text-white">
+                        {{ session.get('username', 'User') }}
+                    </strong>
+                </span>
+
+                <form method="POST"
+                      action="{{ url_for('auth.logout') }}"
+                      class="m-0">
+                    <input type="hidden"
+                           name="csrf_token"
+                           value="{{ csrf_token() }}">
+                    <button type="submit"
+                            class="btn btn-outline-light btn-sm">
+                        Logout
+                    </button>
+                </form>
+            </div>
+        </div>
+    </nav>
+
 
     <div class="container py-5">
 
@@ -1072,16 +1283,6 @@ def incidents():
                 </p>
             </div>
 
-            <div>
-                <a href="{{ url_for('timeline') }}"
-                   class="btn btn-outline-primary">Timeline</a>
-
-                <a href="{{ url_for('alerts') }}"
-                   class="btn btn-outline-danger">Alerts</a>
-
-                <a href="{{ url_for('evidence') }}"
-                   class="btn btn-outline-secondary">Evidence</a>
-            </div>
         </div>
 
         {% with messages = get_flashed_messages() %}
@@ -1096,6 +1297,7 @@ def incidents():
                 <h4 class="mb-3">Create New Incident</h4>
 
                 <form method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                     <input type="hidden" name="action" value="create">
 
@@ -1205,6 +1407,7 @@ def incidents():
                     <h5>Update Incident Status</h5>
 
                     <form method="post" class="row g-2 mb-4">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                         <input type="hidden" name="action" value="status">
                         <input type="hidden"
@@ -1231,6 +1434,7 @@ def incidents():
                     <h5>Add Investigation Finding</h5>
 
                     <form method="post" class="mb-4">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                         <input type="hidden" name="action" value="finding">
                         <input type="hidden"
@@ -1261,6 +1465,7 @@ def incidents():
                     <h5>Link Existing Evidence</h5>
 
                     <form method="post" class="row g-2 mb-4">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                         <input type="hidden"
                                name="action"
@@ -1352,8 +1557,10 @@ def incidents():
 # --------------------------------------------------
 
 if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
     app.run(
         host="0.0.0.0",
         port=5000,
-        debug=True
+        debug=False
     )
